@@ -140,9 +140,13 @@ const AVAIL_REASSERT_MS = 10 * 60_000
 // Pre-turn wake debounce. The FIRST wake from
 // an idle state arms this timer; wakes arriving within the window FOLD INTO it —
 // the turn snapshots ALL unread, so a burst of group messages becomes ONE big-
-// engine turn instead of N. Content-blind, no classification. Trades a small reply
-// latency (a beat before the agent starts) for far fewer spawns in a busy room.
-const WAKE_DEBOUNCE_MS = 2_500
+// engine turn instead of N. Content-blind, no classification.
+//
+// 500ms, not 2.5s: this delay sits on the critical path of EVERY reply, and a live
+// chat measurement showed the two waits (2.53s each) costing more perceived
+// latency than the coalescing saved — a room's burst still folds in at 500ms
+// because the timer only starts once the first wake lands.
+const WAKE_DEBOUNCE_MS = 500
 // Same-turn group notice (default ON — set CUMORA_BYOA_STEER_GROUP=0
 // to disable). A DIRECT ping (DM / @me / human) is ALWAYS steered into the live
 // turn (see maybeSteer). With this on, plain GROUP activity arriving while busy
@@ -852,6 +856,9 @@ export function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'zcode') {
     return 'Open ZCode on that computer and run `zcode` to refresh its login, model access, or quota, then wake the agent again.'
   }
+  if (engine === 'maka') {
+    return 'Open Maka on that computer and run `maka` to refresh its login, model access, or quota, then wake the agent again.'
+  }
   return 'Check the daemon terminal for details, then wake the agent again.'
 }
 
@@ -874,6 +881,7 @@ function missingEngineMessage(): string {
     '  - ZCode: install the `zcode` CLI, then run `zcode` once to sign in',
     '    (the daemon drives it through the npm-published `zcode-acp-server` bridge via npx;',
     '     CUMORA_ZCODE_ACP_BIN pins a specific bridge copy when needed)',
+    '  - Maka: install the `maka` CLI, then run `maka` once to sign in',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -1643,7 +1651,7 @@ interface PendingHop {
   runId: string | null
   conversationId: string | null
   model: string
-  usage: TokenUsage | null
+  usage?: TokenUsage | null
   latencyMs: number
   status: 'ok' | 'rate_limited' | 'timeout' | 'failed'
   error?: string | null
@@ -1917,7 +1925,7 @@ export class AgentRunner {
         runId: this.currentRunId,
         conversationId: this.lastWakeConvo,
         model: report.model,
-        usage: this.hopUsageOf(report.usage),
+        usage: report.usage ? this.hopUsageOf(report.usage) : undefined,
         latencyMs: report.latencyMs ?? 0,
         status: 'ok',
         extras: Object.keys(extras).length ? extras : undefined,
@@ -2385,6 +2393,11 @@ export class AgentRunner {
     if (!payload) return null
     if (payload.verdict) return payload.verdict // hard rule / empty inbox — no model needed
     if (!payload.instructions || !payload.input) return null
+    // No per-engine "skip triage" escape hatch. It looked like a win (dodge one
+    // cold CLI spawn per wake) but triage is NOT on the reply critical path:
+    // triage-core answers human DMs/groups deterministically without a model,
+    // and the small brain runs on the local cheap model. The escape hatch only
+    // made one engine judge its own inbox instead of using the shared gate.
 
     // Triage concurrency gate + deterministic spawn pacer. Pacer is shared
     // with the big-brain path (same Anthropic/OpenAI account quota, same
@@ -2510,6 +2523,7 @@ export class AgentRunner {
     if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
     if (this.adapter.id === 'antigravity') return this.agent.model ?? 'gemini-3.8-flash-high'
     if (this.adapter.id === 'zcode') return this.agent.model ?? '<zcode-default>'
+    if (this.adapter.id === 'maka') return '<maka-default>'
     if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
     return this.agent.model ?? '<cursor-default>'
   }
@@ -2676,6 +2690,11 @@ export class AgentRunner {
       // coordinates identically to the cloud pod-agent.
       GLANCE_YIELD_RULES + `\n\n` +
       postingMechanicsText(this.promptSurface()) +
+      `After your work is complete and your final \`cumora reply\` returns success, end the turn. ` +
+      `Do NOT restate it, summarise it, or narrate what you just did. ` +
+      `A progress update or a brief reply to a mid-task ping does not complete your task — continue the work. ` +
+      // agy's command-safety monitor re-reviews shell operators on each call.
+      `Keep each \`cumora\` call a SINGLE fully quoted command with no pipes, \`&&\`, or redirection. ` +
       `When you're answering a ` +
       `SPECIFIC message, add \`--quote <message_id>\` so your reply threads to its context. ` +
       `To address a teammate, @<their-id> (the short id in \`cumora messages\` / \`cumora participants\`), ` +

@@ -401,10 +401,10 @@ export async function loginCodexRuntime(): Promise<void> {
   })
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode', 'maka']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -763,7 +763,7 @@ export interface EngineHopReport {
    *  gpt-5.5). The model on this hop's own message — NOT the session default,
    *  since native auto-compaction etc. can switch models mid-turn. */
   model: string
-  usage: EngineUsage
+  usage?: EngineUsage
   /** Wall-clock ms since the engine emitted this hop's first event to the
    *  emission of its terminating event (so cache warming etc. are visible). */
   latencyMs?: number
@@ -2767,8 +2767,8 @@ function extractAcpUsage(result: unknown): EngineUsage | undefined {
   const usage: EngineUsage = {
     input_tokens: num(raw.input_tokens) ?? num(raw.inputTokens),
     output_tokens: num(raw.output_tokens) ?? num(raw.outputTokens),
-    cache_read_input_tokens: num(raw.cache_read_input_tokens) ?? num(raw.cacheReadInputTokens),
-    cache_creation_input_tokens: num(raw.cache_creation_input_tokens) ?? num(raw.cacheCreationInputTokens),
+    cache_read_input_tokens: num(raw.cache_read_input_tokens) ?? num(raw.cachedReadTokens) ?? num(raw.cacheReadInputTokens),
+    cache_creation_input_tokens: num(raw.cache_creation_input_tokens) ?? num(raw.cachedWriteTokens) ?? num(raw.cacheCreationInputTokens),
   }
   if (usage.input_tokens == null && usage.output_tokens == null) return undefined
   return usage
@@ -3035,6 +3035,8 @@ class AcpRpcConnection {
   private reqId = 0
   /** In-flight requests awaiting their JSON-RPC response. */
   private readonly waiters = new Map<number, (msg: AcpMsg) => void>()
+  private readonly stdoutDecoder = new StringDecoder('utf8')
+  private readonly stderrDecoder = new StringDecoder('utf8')
   private outBuf = ''
   /** Settles when the handshake completes; rejects when the handshake or the
    *  process itself failed. send() awaits it, and so does probeWake(). */
@@ -3048,6 +3050,7 @@ class AcpRpcConnection {
     sessionParams: () => Record<string, unknown>,
     hooks: AcpRpcConnectionHooks,
     signal?: AbortSignal,
+    private readonly attachMethod: 'session/load' | 'session/resume' = 'session/load',
   ) {
     this.child = spawnEngineChild(spawnSpec.command, spawnSpec.args, {
       cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: spawnSpec.shell,
@@ -3058,7 +3061,7 @@ class AcpRpcConnection {
     this.signal = signal
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => {
-      for (const raw of b.toString('utf8').split('\n')) {
+      for (const raw of this.stderrDecoder.write(b).split('\n')) {
         const l = cleanLine(raw)
         if (l) this.hooks.onLog(l)
       }
@@ -3094,13 +3097,19 @@ class AcpRpcConnection {
     })
   }
 
+  /** Reply to a server→client JSON-RPC request (e.g. session/request_permission). */
+  reply(id: number | string, result: unknown): void {
+    if (this.dead || this.stopRequested) return
+    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
+  }
+
   stop(options: { force?: boolean } = {}): Promise<void> {
     this.stopRequested = true
     try { this.child.stdin?.end() } catch { /* ignore */ }
     return terminateEngineTree(this.child, options.force)
   }
 
-  /** initialize → session/load|new. A stale resume falls back to a fresh
+  /** initialize → session/load|resume|new. A stale resume falls back to a fresh
    *  session; anything else rejects `ready` and fails the pending turn. */
   private async handshake(): Promise<void> {
     await this.rpc('initialize', {
@@ -3110,7 +3119,7 @@ class AcpRpcConnection {
     })
     if (this.sid) {
       try {
-        this.absorbSessionId(await this.rpc('session/load', { sessionId: this.sid, ...this.sessionParams() }))
+        this.absorbSessionId(await this.rpc(this.attachMethod, { sessionId: this.sid, ...this.sessionParams() }))
         this.resumed = true
         return
       } catch (err) {
@@ -3124,7 +3133,7 @@ class AcpRpcConnection {
   }
 
   private onStdout(buf: Buffer): void {
-    this.outBuf += buf.toString('utf8')
+    this.outBuf += this.stdoutDecoder.write(buf)
     let nl: number
     while ((nl = this.outBuf.indexOf('\n')) >= 0) {
       const line = this.outBuf.slice(0, nl)
@@ -3134,7 +3143,7 @@ class AcpRpcConnection {
       let msg: AcpMsg | null = null
       try { msg = JSON.parse(t) as AcpMsg } catch { msg = null }
       if (!msg) { const c = cleanLine(line); if (c) this.hooks.onLog(c); continue }
-      if (msg.id !== undefined) {
+      if (msg.id !== undefined && !msg.method) {
         const waiter = this.waiters.get(msg.id)
         if (waiter) { this.waiters.delete(msg.id); waiter(msg); continue }
       }
@@ -3231,7 +3240,7 @@ class ZcodeSession implements EngineSession {
         try {
           this.onHopUsage({
             model: this.model ?? 'zcode',
-            usage: usage ?? {},
+            usage,
             latencyMs: Date.now() - startedAt,
             hopIndex: 1,
           })
@@ -3417,6 +3426,328 @@ class ZcodeAdapter implements EngineAdapter {
         ? 'aborted (timeout)'
         : err instanceof Error ? err.message : String(err)
       return { ok: false, detail: `zcode bridge handshake failed: ${why}`.slice(0, 240) }
+    } finally {
+      await session.stop({ force: true })
+    }
+  }
+}
+
+// ─── maka ─────────────────────────────────────────────────────────────────
+// Apache Maka (`maka --acp`) ACP v1 persistent session: initialize →
+// session/resume (fallback session/new) → permission_mode=bypass → session/prompt.
+
+/** Resolve `CUMORA_MAKA_BIN` or `maka` on `env.PATH`. */
+export function resolveMakaBin(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env.CUMORA_MAKA_BIN?.trim()
+  if (explicit) return explicit
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const candidate = join(dir, IS_WIN ? 'maka.cmd' : 'maka')
+    if (existsSync(candidate)) return candidate
+    if (IS_WIN && existsSync(join(dir, 'maka.exe'))) return join(dir, 'maka.exe')
+    if (IS_WIN && existsSync(join(dir, 'maka'))) return join(dir, 'maka')
+  }
+  return null
+}
+
+/** Locate the `maka --acp` spawn command on this machine. */
+function resolveMakaAcpSpawn(env: NodeJS.ProcessEnv): { command: string; args: string[]; shell: boolean } {
+  const explicit = env.CUMORA_MAKA_BIN?.trim()
+  if (explicit) {
+    if (/\.[cm]?js$/i.test(explicit)) return { command: process.execPath, args: [explicit, '--acp'], shell: false }
+    const sp = resolveSpawn(explicit)
+    return { command: sp.command, args: ['--acp'], shell: sp.shell }
+  }
+  const sp = resolveSpawn(resolveMakaBin(env) ?? 'maka')
+  return { command: sp.command, args: ['--acp'], shell: sp.shell }
+}
+
+interface MakaTurnOptions {
+  cwd: string
+  env: NodeJS.ProcessEnv
+  prompt: string
+  model?: string | null
+  resumeSessionId?: string | null
+  signal: AbortSignal
+  onLog?: (line: string) => void
+  onHopUsage?: (r: EngineHopReport) => void
+}
+
+interface MakaSessionOptions extends EngineSessionArgs {
+  onAgentText?: (text: string) => void
+  signal?: AbortSignal
+}
+
+const MAKA_MISSING_SESSION_RE =
+  /runtime host session was not found|archived runtime host sessions cannot be loaded|session is not owned by this acp connection|cwd does not match the existing session workspace/i
+
+class MakaSession implements EngineSession {
+  readonly carriesStandingPrompt = false
+
+  private readonly conn: AcpRpcConnection
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private readonly onAgentText?: (text: string) => void
+  private readonly model: string | null
+  private permissionModeUnapplied = true
+  private modelWarned = false
+  private turn: { resolve: (r: EngineRunResult) => void } | null = null
+  private promptInFlight = false
+  private steerWarned = false
+  private stopped = false
+
+  constructor(home: string, env: NodeJS.ProcessEnv, opts: MakaSessionOptions) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.onAgentText = opts.onAgentText
+    this.model = opts.model ?? null
+    this.conn = new AcpRpcConnection(
+      resolveMakaAcpSpawn(env),
+      home,
+      env,
+      opts.resumeSessionId ?? null,
+      () => ({ cwd: home, mcpServers: [] }),
+      {
+        onLog: (line) => this.onLog(line),
+        onNotification: (msg) => this.onUpdate(msg),
+        onDeath: (code, why) => this.onDeath(code, why),
+        onLoadFallback: (why) => {
+          this.onLog(`[maka] session/resume failed (${why}) — starting a fresh session`)
+        },
+      },
+      opts.signal,
+      'session/resume',
+    )
+  }
+
+  get alive(): boolean { return this.conn.alive }
+  get sessionId(): string | null { return this.conn.sid }
+  whenReady(): Promise<void> { return this.conn.ready }
+
+  async send(prompt: string): Promise<EngineRunResult> {
+    if (this.turn) return classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.conn.sid }, this.conn.resumed)
+    if (!this.alive) return classifyEngineResult({ exitCode: this.conn.exitStatusCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.conn.sid }, this.conn.resumed)
+    let resolveTurn!: (r: EngineRunResult) => void
+    const done = new Promise<EngineRunResult>((resolve) => { resolveTurn = resolve })
+    let settled = false
+    const settle = (r: EngineRunResult) => { if (!settled) { settled = true; this.turn = null; resolveTurn(r) } }
+    this.turn = { resolve: settle }
+    try {
+      await this.conn.ready
+      await this.applySessionConfig()
+      if (!this.alive) throw new Error('engine session is not alive (process gone)')
+      const wasResume = this.conn.resumed
+      const startedAt = Date.now()
+      this.promptInFlight = true
+      const resp = await this.conn.rpc('session/prompt', {
+        sessionId: this.conn.sid,
+        prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+      })
+      this.conn.resumed = false
+      const stopReason = (resp.result as { stopReason?: unknown } | undefined)?.stopReason
+      if (stopReason === 'cancelled') {
+        settle(this.failureResult('maka turn was cancelled', wasResume, 1))
+        return done
+      }
+      const usage = extractAcpUsage(resp.result) ?? undefined
+      if (this.onHopUsage) {
+        try {
+          this.onHopUsage({
+            model: '<maka-default>',
+            usage,
+            latencyMs: Date.now() - startedAt,
+            hopIndex: 1,
+          })
+        } catch { /* never break the stream */ }
+      }
+      settle(classifyEngineResult({ exitCode: 0, sessionId: this.conn.sid, usage, model: '<maka-default>' }, wasResume))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const wasResume = this.conn.resumed
+      this.conn.resumed = false
+      settle(this.failureResult(message, wasResume, this.conn.exitStatusCode || 1))
+    } finally {
+      this.promptInFlight = false
+    }
+    return done
+  }
+
+  steer(_text: string): void {
+    if (!this.steerWarned) {
+      this.steerWarned = true
+      this.log('[maka] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
+    }
+  }
+
+  async stop(options: { force?: boolean } = {}): Promise<void> {
+    this.stopped = true
+    await this.conn.stop(options)
+  }
+
+  private async applySessionConfig(): Promise<void> {
+    if (!this.conn.sid) return
+    if (!this.modelWarned && this.model) {
+      this.modelWarned = true
+      this.log(`[maka] model pin (${this.model}) is ignored — Maka selects its model in its own settings; ACP does not expose model selection`)
+    }
+    if (this.permissionModeUnapplied) {
+      try {
+        await this.conn.rpc('session/set_config_option', {
+          sessionId: this.conn.sid,
+          configId: 'permission_mode',
+          value: 'bypass',
+        })
+        this.permissionModeUnapplied = false
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err)
+        this.log(`[maka] permission_mode pin rejected (${why}) — continuing`)
+      }
+    }
+  }
+
+  private failureResult(message: string, wasResume: boolean, exitCode = 1): EngineRunResult {
+    // The wording is Maka's own and unambiguous, so it classifies whether or not
+    // this turn began as a resume. Gating it on `resumed` let a session that
+    // disappeared AFTER a successful turn fall through as an unknown error,
+    // skipping recovery and leaving the connection on a stale session id.
+    const missingSession = MAKA_MISSING_SESSION_RE.test(message)
+    return classifyEngineResult({
+      exitCode,
+      error: message,
+      failure: missingSession
+        ? { kind: 'resume-not-found', message, diagnostic: message }
+        : undefined,
+      sessionId: this.conn.sid,
+    }, wasResume)
+  }
+
+  private onDeath(code: number, why: string): void {
+    if (!this.stopped) {
+      this.log(`[session] engine process died ${this.turn ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    const wasResume = this.conn.resumed
+    this.conn.resumed = false
+    this.turn?.resolve(this.failureResult(why, wasResume, code))
+  }
+
+  private onUpdate(msg: AcpMsg): void {
+    if (msg.method === 'session/request_permission' && msg.id !== undefined) {
+      const options = Array.isArray(msg.params?.options)
+        ? msg.params.options as Array<{ optionId?: unknown; kind?: unknown }>
+        : []
+      const preferred = options.find((o) => o?.kind === 'allow_always')
+        ?? options.find((o) => o?.kind === 'allow_once')
+      if (typeof preferred?.optionId === 'string' && preferred.optionId) {
+        this.conn.reply(msg.id, { outcome: { outcome: 'selected', optionId: preferred.optionId } })
+      } else {
+        this.conn.reply(msg.id, { outcome: { outcome: 'cancelled' } })
+      }
+      return
+    }
+    if (msg.method !== 'session/update' || !this.promptInFlight) return
+    const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
+    const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
+    if (kind === 'tool_call' && typeof u?.title === 'string') {
+      this.log(`[maka] tool ${u.title}`)
+    } else if (kind === 'agent_message_chunk') {
+      const content = u?.content as { text?: unknown } | undefined
+      if (typeof content?.text === 'string' && content.text) {
+        this.onAgentText?.(content.text)
+        if (content.text.trim()) this.log(`[maka] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+      }
+    }
+  }
+
+  private log(line: string): void { this.onLog(line) }
+}
+
+async function runMakaAcpTurn(opts: MakaTurnOptions): Promise<EngineRunResult & { text: string }> {
+  const chunks: string[] = []
+  const session = new MakaSession(opts.cwd, opts.env, {
+    home: opts.cwd,
+    env: opts.env,
+    model: opts.model,
+    standingPrompt: null,
+    resumeSessionId: opts.resumeSessionId ?? null,
+    onLog: opts.onLog ?? (() => {}),
+    onHopUsage: opts.onHopUsage,
+    onAgentText: (text) => chunks.push(text),
+    signal: opts.signal,
+  })
+  try {
+    return { ...await session.send(opts.prompt), text: chunks.join('') }
+  } finally {
+    await session.stop({ force: true })
+  }
+}
+
+class MakaAdapter implements EngineAdapter {
+  readonly id = 'maka' as const
+  readonly bin = 'maka'
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.agents', 'skills'), { recursive: true })
+    await atomicAgentWrite(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }),
+    )
+  }
+
+  run(args: EngineRunArgs): Promise<EngineRunResult> {
+    return runMakaAcpTurn({
+      cwd: args.home,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      resumeSessionId: args.resumeSessionId,
+      signal: args.signal,
+      onLog: args.onLog,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    return new MakaSession(args.home, args.env, args)
+  }
+
+  classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    return runMakaAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      signal: args.signal,
+      onLog: args.onLog,
+    })
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    return runMakaAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: DOCTOR_PROMPT,
+      signal: args.signal,
+    })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    const session = new MakaSession(args.cwd, args.env, {
+      home: args.cwd,
+      env: args.env,
+      standingPrompt: null,
+      resumeSessionId: null,
+      onLog: () => {},
+      signal: args.signal,
+    })
+    try {
+      await session.whenReady()
+      return { ok: true, detail: '' }
+    } catch (err) {
+      const why = args.signal.aborted
+        ? 'aborted (timeout)'
+        : err instanceof Error ? err.message : String(err)
+      return { ok: false, detail: `maka acp handshake failed: ${why}`.slice(0, 240) }
     } finally {
       await session.stop({ force: true })
     }
@@ -5443,8 +5774,10 @@ interface AntigravityEvent {
     step_index?: number
     state?: string
     step_type?: string
+    tool_name?: string
     text_delta?: string
     tool_info?: unknown
+    usage?: AntigravityNativeUsage
   }
   result?: {
     conversation_id?: string
@@ -5464,15 +5797,15 @@ function antigravityCounter(value: unknown): number {
 
 /** Convert Antigravity's counters without charging cache reads twice.
  *
- * `input_tokens` is the complete prompt, including cache reads (the documented
- * examples satisfy total = input + output). Cumora's common shape wants fresh
- * input and cache reads in disjoint fields. `thinking_tokens` is a subset of
- * output_tokens, not an extra token class, so it is intentionally not added
- * again. */
+ * When `input_tokens` includes `cache_read_tokens` (`input_tokens >= cache_read_tokens`),
+ * subtract `cache_read_tokens` so fresh input and cache reads stay disjoint. When
+ * `agy` reports `input_tokens` already net of cache reads (`input_tokens < cache_read_tokens`,
+ * where `total_tokens = input_tokens + output_tokens`), preserve `input_tokens` as-is. */
 function antigravityUsage(raw: AntigravityNativeUsage | undefined): EngineUsage | undefined {
   if (!raw) return undefined
   const cached = antigravityCounter(raw.cache_read_tokens)
-  const input = Math.max(0, antigravityCounter(raw.input_tokens) - cached)
+  const rawInput = antigravityCounter(raw.input_tokens)
+  const input = rawInput >= cached ? rawInput - cached : rawInput
   const output = antigravityCounter(raw.output_tokens)
   if (!input && !output && !cached) return undefined
   return {
@@ -5503,6 +5836,19 @@ function antigravityUsageDelta(
   }
 }
 
+function addAntigravityUsage(
+  acc: AntigravityNativeUsage | undefined,
+  step: AntigravityNativeUsage,
+): AntigravityNativeUsage {
+  return {
+    input_tokens: antigravityCounter(acc?.input_tokens) + antigravityCounter(step.input_tokens),
+    output_tokens: antigravityCounter(acc?.output_tokens) + antigravityCounter(step.output_tokens),
+    thinking_tokens: antigravityCounter(acc?.thinking_tokens) + antigravityCounter(step.thinking_tokens),
+    cache_read_tokens: antigravityCounter(acc?.cache_read_tokens) + antigravityCounter(step.cache_read_tokens),
+    total_tokens: antigravityCounter(acc?.total_tokens) + antigravityCounter(step.total_tokens),
+  }
+}
+
 function parseAntigravityLine(line: string): AntigravityEvent | null {
   if (!line.startsWith('{')) return null
   try { return JSON.parse(line) as AntigravityEvent } catch { return null }
@@ -5515,25 +5861,32 @@ class AntigravityTurnTracker {
   error: string | null = null
   usage: EngineUsage | undefined
   private previousUsage: AntigravityNativeUsage | undefined
+  private turnStepUsage: AntigravityNativeUsage | undefined
   private startedAt: number | null = null
   private toolUses = 0
   private readonly seenToolSteps = new Set<number>()
+  private readonly seenResponseSteps = new Set<number>()
   private hopIndex = 0
+  private awaitingResumedBaseline: boolean
 
   constructor(
     pin: string | null,
     private readonly onHopUsage?: (report: EngineHopReport) => void,
+    resumedFromDisk = false,
   ) {
     this.model = pin
+    this.awaitingResumedBaseline = resumedFromDisk
   }
 
   beginTurn(): void {
     this.text = ''
     this.error = null
     this.usage = undefined
+    this.turnStepUsage = undefined
     this.startedAt = Date.now()
     this.toolUses = 0
     this.seenToolSteps.clear()
+    this.seenResponseSteps.clear()
   }
 
   /** Feed one event. True means the current turn reached its terminal result. */
@@ -5549,6 +5902,12 @@ class AntigravityTurnTracker {
         this.seenToolSteps.add(step.step_index)
         this.toolUses += 1
       }
+      if (step?.step_type === 'agent_response' && step.state === 'DONE' && step.usage) {
+        if (typeof step.step_index !== 'number' || !this.seenResponseSteps.has(step.step_index)) {
+          if (typeof step.step_index === 'number') this.seenResponseSteps.add(step.step_index)
+          this.turnStepUsage = addAntigravityUsage(this.turnStepUsage, step.usage)
+        }
+      }
       return false
     }
     if (event.event !== 'result' || !event.result) return false
@@ -5560,15 +5919,17 @@ class AntigravityTurnTracker {
         ? result.error
         : `antigravity turn ended with status ${result.status || 'UNKNOWN'}`
     }
-    const delta = antigravityUsageDelta(result.usage, this.previousUsage)
-    // Only a result that CARRIES usage moves the baseline. `usage` is optional
-    // in the protocol and an errored turn routinely omits it — overwriting the
-    // baseline with `undefined` there bills the next turn's whole cumulative
-    // session counter as one turn, which is the exact double-billing this
-    // tracker exists to prevent. Keeping the last known total means a
-    // usage-less turn bills nothing (correct: the CLI reported no spend) and
-    // the turn after it still bills only its own delta.
-    if (result.usage) this.previousUsage = result.usage
+    // Prefer the sum of per-step `agent_response` usages emitted during this turn:
+    // when resuming via `--conversation <id>`, `result.usage` includes historical
+    // turns from prior processes, whereas `turnStepUsage` covers only the current
+    // turn. Fall back to cumulative `result.usage` delta when no step usage was
+    // emitted (e.g. synthetic fixtures or pre-step errors on fresh sessions).
+    const delta = this.turnStepUsage
+      ?? (this.awaitingResumedBaseline ? undefined : antigravityUsageDelta(result.usage, this.previousUsage))
+    if (result.usage) {
+      this.previousUsage = result.usage
+      this.awaitingResumedBaseline = false
+    }
     this.usage = antigravityUsage(delta)
     if (this.usage && this.onHopUsage) {
       this.hopIndex += 1
@@ -5587,6 +5948,13 @@ class AntigravityTurnTracker {
   }
 }
 
+/** Re-inline the full standing prompt every N turns. `agy` exposes no
+ *  system-prompt file, so turn 1 carries it inline; keeping it out of turns
+ *  2..N is what stops a persistent transcript from growing by a whole standing
+ *  prompt (~5k tokens) on every wake. The periodic refresh covers the engine's
+ *  native compaction dropping old turns. */
+const ANTIGRAVITY_STANDING_REFRESH_TURNS = 8
+
 class AntigravitySession implements EngineSession {
   private readonly child: ChildProcess
   private readonly tracker: AntigravityTurnTracker
@@ -5598,7 +5966,10 @@ class AntigravitySession implements EngineSession {
   private stdoutTail: string[] = []
   private pending: { resolve: (result: EngineRunResult) => void } | null = null
   private stopPromise: Promise<void> | null = null
-  readonly carriesStandingPrompt = false
+  /** Whether this process's transcript already contains the standing prompt. */
+  private standingDelivered: boolean
+  /** Turns completed since the standing prompt was last inlined. */
+  private standingTurns = 0
 
   constructor(
     command: string,
@@ -5607,7 +5978,10 @@ class AntigravitySession implements EngineSession {
     private readonly opts: EngineSessionArgs,
     pin: string | null,
   ) {
-    this.tracker = new AntigravityTurnTracker(pin, opts.onHopUsage)
+    this.tracker = new AntigravityTurnTracker(pin, opts.onHopUsage, Boolean(opts.resumeSessionId))
+    // A resumed conversation already carries the standing prompt from the prior
+    // process; a fresh one gets it inline on its first turn.
+    this.standingDelivered = Boolean(opts.resumeSessionId)
     this.child = spawnEngineChild(command, argv, {
       cwd: opts.home,
       env: opts.env,
@@ -5626,6 +6000,10 @@ class AntigravitySession implements EngineSession {
   get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
   get sessionId(): string | null { return this.tracker.sessionId }
   get text(): string { return this.tracker.text }
+  /** True once the transcript holds the standing prompt, so the daemon sends
+   *  only the per-turn delta. This is the whole reason a long-lived `agy`
+   *  session does not grow by a full standing prompt on every wake. */
+  get carriesStandingPrompt(): boolean { return this.standingDelivered }
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
@@ -5636,21 +6014,31 @@ class AntigravitySession implements EngineSession {
         sessionId: this.sessionId,
       })
     }
+    // The prompt was assembled from carriesStandingPrompt a moment ago (see
+    // daemon.turnPrompt), so an inlined standing prompt is about to enter the
+    // transcript. Remember it on a SUCCESSFUL write only.
+    const inlinedStanding = !this.standingDelivered
     this.tracker.beginTurn()
     return new Promise((resolve) => {
       this.pending = { resolve }
       const message = JSON.stringify({ event: 'user', message: { content: stripLoneSurrogates(prompt) } })
       if (!writeStdin(this.child, `${message}\n`)) {
         this.settle({ exitCode: 1, error: 'failed to write turn to antigravity', sessionId: this.sessionId })
+        return
+      }
+      if (inlinedStanding) {
+        this.standingDelivered = true
+        this.standingTurns = 0
       }
     })
   }
 
   steer(_text: string): void {
+    if (!this.pending) return
     // The documented protocol requires waiting for a result before the next
     // user event. Queueing mid-turn would be an undocumented race; the daemon's
     // normal coalesced wake delivers the ping after this turn instead.
-    if (this.pending) this.opts.onLog('[antigravity] same-turn steer is not supported; the ping rides the next wake')
+    this.opts.onLog('[antigravity] same-turn steer is not supported; the ping rides the next wake')
   }
 
   stop(options: { force?: boolean } = {}): Promise<void> {
@@ -5686,8 +6074,20 @@ class AntigravitySession implements EngineSession {
     const line = cleanLine(raw)
     if (!line) return
     pushTail(this.stdoutTail, line)
-    this.opts.onLog(line)
     const event = parseAntigravityLine(line)
+    if (event?.event === 'step_update' && event.step_update) {
+      const step = event.step_update
+      const toolName = step.tool_name ?? (step.tool_info as { name?: string } | undefined)?.name
+      if (step.step_type === 'tool' && step.state === 'ACTIVE' && typeof toolName === 'string' && toolName) {
+        this.opts.onLog(`[antigravity] tool ${toolName}`)
+      } else if (step.step_type === 'agent_response' && step.state === 'DONE' && typeof step.text_delta === 'string' && step.text_delta.trim()) {
+        this.opts.onLog(`[antigravity] » ${step.text_delta.replace(/\s+/g, ' ').trim().slice(0, 200)}`)
+      } else {
+        this.opts.onLog(line)
+      }
+    } else {
+      this.opts.onLog(line)
+    }
     if (event && this.tracker.observe(event)) {
       const eventError = this.tracker.error
       this.settle({
@@ -5713,6 +6113,15 @@ class AntigravitySession implements EngineSession {
     const pending = this.pending
     if (!pending) return
     this.pending = null
+    if (this.standingDelivered) {
+      this.standingTurns += 1
+      if (this.standingTurns >= ANTIGRAVITY_STANDING_REFRESH_TURNS) {
+        // Native compaction can drop old turns; re-inline soon so the mechanics
+        // never silently disappear from a long-lived transcript.
+        this.standingDelivered = false
+        this.standingTurns = 0
+      }
+    }
     pending.resolve(result)
   }
 
@@ -5736,30 +6145,37 @@ class AntigravityAdapter implements EngineAdapter {
   readonly id = 'antigravity' as const
   readonly bin = 'agy'
 
-  private sessionArgs(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): string[] {
+  private sessionArgs(args: EngineSessionArgs, mode: 'auto' | 'plan'): string[] {
     const model = args.model ? ['--model', args.model] : []
+    const resume = mode === 'auto' && args.resumeSessionId
+      ? ['--conversation', args.resumeSessionId]
+      : []
+    // Only pass `--sandbox` on the read-only triage/probe ('plan') path.
+    // Real agent turns ('auto') run inside Cumora's outer BYOA boundary and must
+    // write IPC requests to CUMORA_AGENT_IPC_DIR (outside <home>) to invoke
+    // `cumora glance/messages/reply/send` as well as read ~/.gitconfig and
+    // workspace paths; `--sandbox` on real turns causes every `cumora` CLI call
+    // to fail with EPERM on first attempt and waste an extra LLM turn retrying.
+    const sandbox = mode === 'plan' ? ['--sandbox'] : []
     return [
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
-      '--sandbox',
+      ...sandbox,
       '--mode', mode,
       '--dangerously-skip-permissions',
       '--disable-slash-commands',
+      ...resume,
       ...model,
     ]
   }
 
-  private start(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): AntigravitySession {
+  private start(args: EngineSessionArgs, mode: 'auto' | 'plan'): AntigravitySession {
     const { command, shell } = resolveSpawn(this.bin)
-    // Do not pass --conversation across daemon restarts yet. Its result usage is
-    // cumulative over the historical conversation, while Cumora persists only
-    // the id, not the prior counters; resuming would overbill that history as
-    // the first new turn. The per-agent home + memory remains durable.
     return new AntigravitySession(command, this.sessionArgs(args, mode), shell, args, args.model ?? null)
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
-    return this.start(args, 'accept-edits')
+    return this.start(args, 'auto')
   }
 
   async run(args: EngineRunArgs): Promise<EngineRunResult> {
@@ -5773,7 +6189,7 @@ class AntigravityAdapter implements EngineAdapter {
       onLog: args.onLog,
       onHopUsage: args.onHopUsage,
     }
-    const session = this.start(sessionArgs, 'accept-edits')
+    const session = this.start(sessionArgs, 'auto')
     const onAbort = (): void => { void session.stop({ force: true }) }
     args.signal.addEventListener('abort', onAbort, { once: true })
     if (args.signal.aborted) onAbort()
@@ -5840,6 +6256,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   qwen: new QwenAdapter(),
   antigravity: new AntigravityAdapter(),
   zcode: new ZcodeAdapter(),
+  maka: new MakaAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -5859,7 +6276,9 @@ export async function detectEnginesWithStatus(): Promise<EngineDetection> {
   const ids = Object.keys(ADAPTERS) as EngineId[]
   const probes = await Promise.all(ids.map(async (id) => {
     const status = await probeBinOnPath(ADAPTERS[id].bin)
-    const installed = status === 'present' || (id === 'grok' && resolveGrokBin() != null)
+    const installed = status === 'present'
+      || (id === 'grok' && resolveGrokBin() != null)
+      || (id === 'maka' && resolveMakaBin() != null)
     return { id, installed, status }
   }))
   return {
@@ -5902,7 +6321,9 @@ export async function snapshotDetectedEngines(ids?: readonly EngineId[]): Promis
     const bin = ADAPTERS[id].bin
     const path = id === 'grok'
       ? (resolveGrokBin() ?? await resolveBinPath(bin))
-      : await resolveBinPath(bin)
+      : id === 'maka'
+        ? (resolveMakaBin() ?? await resolveBinPath(bin))
+        : await resolveBinPath(bin)
     return { id, bin, path }
   }))
 }
@@ -6030,7 +6451,8 @@ export async function runEngineDoctor(opts?: {
   const ids = opts?.engines ?? Object.keys(ADAPTERS) as EngineId[]
   return Promise.all(ids.map(async (id): Promise<EngineHealth> => {
     const adapter = ADAPTERS[id]
-    const path = (await resolveBinPath(adapter.bin)) ?? (id === 'grok' ? resolveGrokBin(env) : null)
+    const path = (await resolveBinPath(adapter.bin))
+      ?? (id === 'grok' ? resolveGrokBin(env) : id === 'maka' ? resolveMakaBin(env) : null)
     if (!path) return { id, installed: false, path: null, big: null, small: null, wake: null }
     const probeTier = async (tier: 'big' | 'small'): Promise<BrainHealth> => {
       const controller = new AbortController()
