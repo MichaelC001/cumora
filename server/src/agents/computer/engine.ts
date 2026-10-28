@@ -584,6 +584,7 @@ export interface EngineUsage {
 }
 
 export type EngineFailureKind =
+  | 'startup'
   | 'resume-not-found'
   | 'context-overflow'
   | 'authentication'
@@ -611,9 +612,16 @@ const RESUME_NOT_FOUND_RE = new RegExp([
 const ENGINE_CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceeded|maximum context|reached its context|prompt is too long|input is too long|too many tokens/i
 const ENGINE_RATE_LIMIT_RE = /rate.?limit|usage limit|quota|too many requests|overloaded|over capacity|credit balance is too low/i
 const ENGINE_AUTH_RE = /not (?:logged in|authenticated|signed in)|(?<![\w./\\-])(?:sign|log)[ -]?in(?![\w/\\-]|\.\w)|\brun \/login(?![\w/\\-]|\.\w)|unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication failed/i
+const ENGINE_STARTUP_RE = /\bbwrap:\s*execvp\b|\bspawn(?: [^\n]+)? (?:ENOENT|EACCES)\b/i
 const ENGINE_TRANSPORT_RE = /ECONN(?:RESET|REFUSED)|EPIPE|socket hang up|network|connection (?:closed|lost|terminated|timed out)|transport|process (?:exited|terminated)|failed to (?:spawn|write)/i
 
+function startupFailureLine(diagnostic: string): string | undefined {
+  return diagnostic.split('\n').find((line) => ENGINE_STARTUP_RE.test(line))
+}
+
 export function classifyEngineFailure(diagnostic: string, hadResume = false): EngineFailureKind {
+  // A local executable path can itself contain words such as "quota" or "token".
+  if (ENGINE_STARTUP_RE.test(diagnostic)) return 'startup'
   if (hadResume && RESUME_NOT_FOUND_RE.test(diagnostic)) return 'resume-not-found'
   if (ENGINE_CONTEXT_OVERFLOW_RE.test(diagnostic)) return 'context-overflow'
   if (ENGINE_RATE_LIMIT_RE.test(diagnostic)) return 'rate-limit'
@@ -1020,7 +1028,7 @@ export function failurePreview(args: {
   // salientError() already leads with this line, for exactly this reason, but
   // only the probe and handshake paths go through it — an ordinary turn lands
   // here instead. Lead with the cause and keep the full output behind it.
-  const rejected = argvRejection(detail)
+  const rejected = startupFailureLine(detail) ?? argvRejection(detail)
   const body = rejected ? `${rejected}\n${detail}` : detail
   return `${prefix}\n${body}`.slice(0, MAX_FAILURE_CHARS)
 }
@@ -1709,7 +1717,7 @@ class ClaudeAdapter implements EngineAdapter {
     const base = flags.length
       ? [...flags, '-p']
       : allowUnsandboxedByoa(env)
-        ? ['-p', ...model, '--output-format', 'json', '--dangerously-skip-permissions', '--strict-mcp-config']
+        ? ['-p', ...model, '--output-format', 'json', '--tools', '', '--strict-mcp-config']
         : ['-p', ...model, '--output-format', 'json', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const res = await spawnCapture(command, argv, {
@@ -1742,7 +1750,7 @@ class ClaudeAdapter implements EngineAdapter {
     const model = args.tier === 'small' ? claudeFastModelArgs(env) : main ? ['--model', main] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const base = allowUnsandboxedByoa(env)
-      ? ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
+      ? ['-p', ...model, '--output-format', 'text', '--tools', '', '--strict-mcp-config']
       : ['-p', ...model, '--output-format', 'text', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     return spawnCapture(command, argv, {
@@ -1776,7 +1784,7 @@ class ClaudeAdapter implements EngineAdapter {
     const main = claudeMainModel(env)
     const model = main ? ['--model', main] : []
     const base = allowUnsandboxedByoa(env)
-      ? ['-p', ...model, '--output-format', 'text', '--append-system-prompt-file', promptFile, '--dangerously-skip-permissions']
+      ? ['-p', ...model, '--output-format', 'text', '--append-system-prompt-file', promptFile, '--tools', '', '--strict-mcp-config']
       : [
           '-p', ...model, '--output-format', 'text', '--append-system-prompt-file', promptFile,
           '--restricted', '--tools', '', '--strict-mcp-config',
@@ -2057,6 +2065,8 @@ class CodexSession implements EngineSession {
    *  attach latency_ms to the hop report at turn/completed. */
   private turnStartedAt: number | null = null
   private outBuf = ''
+  private stderrTail = ''
+  private hasSent = false
   private threadId: string | null
   private exited = false
   private exitCode = 0
@@ -2068,9 +2078,9 @@ class CodexSession implements EngineSession {
   // thread params WITHOUT threadId — reused to start a FRESH thread if a resume fails.
   private readonly baseThreadParams: Record<string, unknown>
   private ready = false
-  // Why the handshake died, when it did — so a send() landing after the teardown
+  // Why the session died, when it did — so a send() landing after the teardown
   // reports the real cause instead of a generic "process gone".
-  private handshakeError: string | null = null
+  private sessionError: string | null = null
   private pending: { resolve: (r: EngineRunResult) => void } | null = null
   private queuedPrompt: string | null = null
   private activeTurnId: string | null = null
@@ -2107,9 +2117,12 @@ class CodexSession implements EngineSession {
       : { method: 'thread/start', params }
     this.child = spawnEngineChild(bin, spawnArgs, { cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
-    this.child.stderr?.on('data', (b: Buffer) => { for (const raw of b.toString('utf8').split('\n')) { const l = cleanLine(raw); if (l) this.onLog(l) } })
+    this.child.stderr?.on('data', (b: Buffer) => {
+      this.stderrTail = (this.stderrTail + b.toString('utf8')).slice(-MAX_FAILURE_CHARS)
+      for (const raw of b.toString('utf8').split('\n')) { const l = cleanLine(raw); if (l) this.onLog(l) }
+    })
     this.child.on('error', (err) => this.die(1, err.message))
-    this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
+    this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `process terminated by ${sig}` : `process exited with code ${code}`))
     // Begin the handshake once handlers are attached.
     queueMicrotask(() => { this.initializeId = this.req('initialize', { clientInfo: { name: 'cumora-daemon', version: '1.0.0' }, capabilities: { experimentalApi: true } }) })
   }
@@ -2135,7 +2148,11 @@ class CodexSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) return Promise.resolve(classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId }, this.threadWasResume))
-    if (!this.alive) return Promise.resolve(classifyEngineResult({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
+    if (!this.alive) return Promise.resolve(classifyEngineResult({ exitCode: this.exitCode || 1, error: this.sessionError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
+    // Only the first turn inherits output from process startup. Later turns
+    // must not classify an old turn's stderr as their own failure.
+    if (this.hasSent) this.stderrTail = ''
+    this.hasSent = true
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
@@ -2311,6 +2328,7 @@ class CodexSession implements EngineSession {
   private settle(error?: string): void {
     const p = this.pending
     this.pending = null
+    this.stderrTail = ''
     if (p) p.resolve(classifyEngineResult({ exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.model }, this.threadWasResume))
   }
   private failPending(error: string): void {
@@ -2327,12 +2345,18 @@ class CodexSession implements EngineSession {
     // use, protocol drift), so `alive` would keep advertising a usable session
     // and the daemon would reuse the zombie on every wake. Tear it down instead:
     // a !alive session is dropped and the next wake spawns a clean one.
-    if (!this.ready) { this.handshakeError = error; this.stop() }
+    if (!this.ready) { this.sessionError = error; this.stop() }
   }
   private die(code: number, why: string): void {
     const alreadyDown = this.exited
     this.exited = true
-    this.exitCode = code
+    // Exiting before turn/completed is a failed turn, even after a clean EOF.
+    this.exitCode = code || 1
+    const diagnostic = engineDiagnosticText(cleanLine(this.stderrTail))
+    // The daemon displays only the first 900 characters. Keep the startup
+    // cause ahead of noisy stderr so the notice retains both cause and kind.
+    this.sessionError ??= [startupFailureLine(diagnostic), why, diagnostic]
+      .filter(Boolean).join('\n').slice(0, MAX_FAILURE_CHARS)
     // Same idle-death visibility as ClaudeSession.die: a session dying with no
     // turn in flight must leave a trace, not silently vanish until the next wake.
     if (!alreadyDown) {
@@ -2340,7 +2364,7 @@ class CodexSession implements EngineSession {
     }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve(classifyEngineResult({ exitCode: code, error: why, sessionId: this.threadId }, this.threadWasResume))
+    if (p) p.resolve(classifyEngineResult({ exitCode: this.exitCode, error: this.sessionError, sessionId: this.threadId }, this.threadWasResume))
   }
 }
 
@@ -3524,6 +3548,7 @@ interface MakaTurnOptions {
   prompt: string
   model?: string | null
   resumeSessionId?: string | null
+  permissionMode?: 'ask' | 'bypass'
   signal: AbortSignal
   onLog?: (line: string) => void
   onHopUsage?: (r: EngineHopReport) => void
@@ -3532,6 +3557,7 @@ interface MakaTurnOptions {
 interface MakaSessionOptions extends EngineSessionArgs {
   onAgentText?: (text: string) => void
   signal?: AbortSignal
+  permissionMode?: 'ask' | 'bypass'
 }
 
 const MAKA_MISSING_SESSION_RE =
@@ -3545,6 +3571,7 @@ class MakaSession implements EngineSession {
   private readonly onHopUsage?: (r: EngineHopReport) => void
   private readonly onAgentText?: (text: string) => void
   private readonly model: string | null
+  private readonly permissionMode: 'ask' | 'bypass'
   private permissionModeUnapplied = true
   private modelWarned = false
   private turn: { resolve: (r: EngineRunResult) => void } | null = null
@@ -3557,6 +3584,7 @@ class MakaSession implements EngineSession {
     this.onHopUsage = opts.onHopUsage
     this.onAgentText = opts.onAgentText
     this.model = opts.model ?? null
+    this.permissionMode = opts.permissionMode ?? 'bypass'
     this.conn = new AcpRpcConnection(
       resolveMakaAcpSpawn(env),
       home,
@@ -3651,11 +3679,14 @@ class MakaSession implements EngineSession {
         await this.conn.rpc('session/set_config_option', {
           sessionId: this.conn.sid,
           configId: 'permission_mode',
-          value: 'bypass',
+          value: this.permissionMode,
         })
         this.permissionModeUnapplied = false
       } catch (err) {
         const why = err instanceof Error ? err.message : String(err)
+        if (this.permissionMode === 'ask') {
+          throw new Error(`maka permission_mode=ask could not be applied: ${why}`)
+        }
         this.log(`[maka] permission_mode pin rejected (${why}) — continuing`)
       }
     }
@@ -3688,6 +3719,10 @@ class MakaSession implements EngineSession {
 
   private onUpdate(msg: AcpMsg): void {
     if (msg.method === 'session/request_permission' && msg.id !== undefined) {
+      if (this.permissionMode === 'ask') {
+        this.conn.reply(msg.id, { outcome: { outcome: 'cancelled' } })
+        return
+      }
       const options = Array.isArray(msg.params?.options)
         ? msg.params.options as Array<{ optionId?: unknown; kind?: unknown }>
         : []
@@ -3729,6 +3764,7 @@ async function runMakaAcpTurn(opts: MakaTurnOptions): Promise<EngineRunResult & 
     onHopUsage: opts.onHopUsage,
     onAgentText: (text) => chunks.push(text),
     signal: opts.signal,
+    permissionMode: opts.permissionMode,
   })
   try {
     return { ...await session.send(opts.prompt), text: chunks.join('') }
@@ -3775,6 +3811,7 @@ class MakaAdapter implements EngineAdapter {
       model: args.model,
       signal: args.signal,
       onLog: args.onLog,
+      permissionMode: 'ask',
     })
   }
 
@@ -3784,6 +3821,7 @@ class MakaAdapter implements EngineAdapter {
       env: args.env,
       prompt: DOCTOR_PROMPT,
       signal: args.signal,
+      permissionMode: 'ask',
     })
   }
 
@@ -5869,6 +5907,7 @@ class GeminiAdapter implements EngineAdapter {
     const model = ['--model', args.model || triageModel('gemini-2.5-flash-lite')]
     const settings = join(args.cwd, GEMINI_TRIAGE_SETTINGS_FILE)
     let env = geminiEnv(args.env)
+    let staged: string | null = null
     try {
       // Write-then-rename, not writeFile onto the live path. The triage cwd is
       // shared — the doctor hands the SAME dir to every engine's probe, and
@@ -5876,16 +5915,20 @@ class GeminiAdapter implements EngineAdapter {
       // it writes, so a second caller can be mid-truncate while gemini is
       // reading. Identical content does not save us from a zero-length read;
       // rename is atomic, so a reader sees one whole file or the other.
-      const staged = `${settings}.${process.pid}.${randomUUID().slice(0, 8)}`
+      staged = `${settings}.${process.pid}.${randomUUID().slice(0, 8)}`
       await writeFile(staged, GEMINI_TRIAGE_SETTINGS, 'utf8')
       await rename(staged, settings)
       // System scope so it wins over any user/workspace settings the operator
       // has; it MERGES with them, so their auth config is untouched.
       env = { ...env, GEMINI_CLI_SYSTEM_SETTINGS_PATH: settings }
-    } catch {
-      // Triage still works with tools present — the cwd is neutral and the
-      // prompt asks for a direct answer. Losing the guarantee is not worth
-      // losing the classification.
+    } catch (err) {
+      if (staged) await rm(staged, { force: true }).catch(() => {})
+      return {
+        exitCode: 1,
+        error: `could not install Gemini triage settings: ${err instanceof Error ? err.message : String(err)}`,
+        sessionId: null,
+        text: '',
+      }
     }
     return spawnGeminiStream(
       command,
@@ -6068,11 +6111,9 @@ class QwenAdapter implements EngineAdapter {
       command,
       // `--safe-mode` is qwen's own switch for "ignore every customization":
       // context files, hooks, extensions, skills and MCP servers all stay
-      // unloaded, which is the same thing --strict-mcp-config buys the Claude
-      // triage path and keeps a cold triage spawn cheap. It deliberately does
-      // NOT disable auth, and `-y` (an argv flag) still wins over it, so
-      // nothing can stall waiting for an approval nobody is there to give.
-      [...QwenAdapter.STREAM, '--safe-mode', '--yolo', ...model],
+      // unloaded, which keeps a cold triage spawn cheap. Plan mode removes
+      // automatic approval for tool use without changing authentication.
+      [...QwenAdapter.STREAM, '--safe-mode', '--approval-mode', 'plan', ...model],
       {
         cwd: args.cwd,
         env: args.env,
