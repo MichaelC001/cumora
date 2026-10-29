@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
-const { attachmentNote } = await import('../agents/computer/daemon.js')
+const { attachmentNote, attachmentNotes } = await import('../agents/computer/daemon.js')
 
 test('the reported zip is now visible to the agent', () => {
   const note = attachmentNote({
@@ -56,4 +56,17 @@ test('hostile fields cannot run away with the digest line', () => {
   assert.ok(note.length < 260, `digest line must stay bounded, got ${note.length}`)
   assert.equal(note.includes('file:///etc/passwd'), false, 'only http(s) urls are surfaced')
   assert.equal(note.includes('NaN'), false)
+})
+
+test('the inbox digest does not expose signed attachment URLs', () => {
+  const notes = attachmentNotes([{
+    name: 'data.csv',
+    kind: 'file',
+    mime: 'text/csv',
+    size: 12,
+    url: 'https://cdn.cumora.ai/a/abc?sig=secret',
+  }])
+  assert.match(notes, /data\.csv/)
+  assert.equal(notes.includes('cdn.cumora.ai'), false)
+  assert.equal(notes.includes('sig=secret'), false)
 })
