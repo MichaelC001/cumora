@@ -3180,8 +3180,6 @@ api.put('/agents/:id', async (req, res) => {
  * /agents/:id/rehire to bring them back.
  */
 api.delete('/agents/:id', async (req, res) => {
-  // Off-boarding an agent silences it for the whole workspace and removes
-  // it from every conversation's wake roster — destructive, owner/admin only.
   const { companyId: tenant } = await requireCompanyRole(req)
   const id = req.params.id
   const { rows: existing } = await pool.query<{ kind: string; departed_at: string | null }>(
@@ -3190,14 +3188,69 @@ api.delete('/agents/:id', async (req, res) => {
   if (!existing[0]) { res.status(404).json({ error: 'not found' }); return }
   if (existing[0].kind !== 'agent') { res.status(400).json({ error: 'cannot off-board non-agent participant' }); return }
   if (existing[0].departed_at) { res.status(409).json({ error: 'already off-boarded' }); return }
-  await pool.query(
-    `UPDATE participants
-        SET departed_at = NOW(),
-            status = 'resting',
-            status_updated_at = NOW()
-      WHERE id = $1 AND company_id = $2`,
-    [id, tenant],
-  )
+
+  // Membership rows are the single source of truth for a room's roster, so a
+  // participant update alone leaves the agent seated in every group.
+  await withOutboxTransaction(async (client) => {
+    // Same lock order every membership mutation uses: the participant row
+    // first, then the conversations. A concurrent invite/leave either lands
+    // before this transaction (and is undone by the bulk delete below) or
+    // after it (and is rejected by the departed_at predicate), never halfway.
+    const locked = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2 AND kind = 'agent' AND departed_at IS NULL
+        FOR UPDATE`,
+      [id, tenant],
+    )
+    if (!locked.rowCount) throw new HttpError(409, 'agent is no longer active')
+
+    // Direct chats keep their membership so a rehire resumes the same thread,
+    // the rule the human workspace-removal path follows. GET /conversations
+    // hides them from the other side while the agent is departed.
+    const { rows: conversations } = await client.query<{ id: string }>(
+      `SELECT c.id
+         FROM conversations c
+         JOIN conversation_members cm
+           ON cm.conversation_id = c.id AND cm.company_id = c.company_id
+        WHERE c.company_id = $1
+          AND cm.participant_id = $2
+          AND c.kind <> 'direct'
+        ORDER BY c.id
+        FOR UPDATE OF c`,
+      [tenant, id],
+    )
+    const conversationIds = conversations.map((row) => row.id)
+    if (conversationIds.length > 0) {
+      await client.query(
+        `DELETE FROM conversation_members
+          WHERE company_id = $1 AND participant_id = $2
+            AND conversation_id = ANY($3::text[])`,
+        [tenant, id, conversationIds],
+      )
+      await client.query(
+        `SELECT refresh_conversation_members_projection(cid)
+           FROM unnest($1::text[]) affected(cid)`,
+        [conversationIds],
+      )
+    }
+
+    await client.query(
+      `UPDATE participants
+          SET departed_at = NOW(),
+              status = 'resting',
+              status_updated_at = NOW()
+        WHERE id = $1 AND company_id = $2`,
+      [id, tenant],
+    )
+
+    await enqueueBroadcast(client, CH_STATUS, {
+      type: 'participants.roster_changed',
+      kind: 'departed',
+      companyId: tenant,
+      participantId: id,
+    })
+  })
+
   const { invalidatePersonaCache } = await import('../agents/personas.js')
   invalidatePersonaCache(id)
   // Reclaim the agent's chrome-profile PVC. Off-board is the agent's
@@ -3372,14 +3425,23 @@ api.post('/agents/:id/rehire', async (req, res) => {
   if (existing[0].kind !== 'agent') { res.status(400).json({ error: 'cannot rehire non-agent participant' }); return }
   if (!existing[0].departed_at) { res.status(409).json({ error: 'agent is not off-boarded' }); return }
   await assertCompanyAgentLimit(tenant)
-  await pool.query(
-    `UPDATE participants
-        SET departed_at = NULL,
-            status = 'avail',
-            status_updated_at = NOW()
-      WHERE id = $1 AND company_id = $2`,
-    [id, tenant],
-  )
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE participants
+          SET departed_at = NULL,
+              status = 'avail',
+              status_updated_at = NOW()
+        WHERE id = $1 AND company_id = $2`,
+      [id, tenant],
+    )
+    // Off-board hid the shared direct chats from the other side rather than
+    // deleting them, so the roster refetch this triggers puts those threads
+    // back. Without the frame the sidebar would keep hiding them until the
+    // next manual reload.
+    await enqueueBroadcast(client, CH_STATUS, {
+      type: 'participants.roster_changed', kind: 'rehired', companyId: tenant, participantId: id,
+    })
+  })
   const { invalidatePersonaCache } = await import('../agents/personas.js')
   invalidatePersonaCache(id)
   res.json({ ok: true })
@@ -3485,6 +3547,24 @@ api.get('/conversations', async (req, res) => {
            WHERE cm.conversation_id = c.id
              AND cm.company_id = c.company_id
              AND cm.participant_id = $1
+        )
+        -- An off-boarded agent keeps its direct-chat membership so a rehire
+        -- finds the same thread again (same rule the human workspace-removal
+        -- path follows). The chat itself must still leave the sidebar for the
+        -- person who stayed: a two-person room with one departed member is a
+        -- dead row that only draws a grey portrait.
+        AND (
+          c.kind <> 'direct'
+          OR NOT EXISTS (
+            SELECT 1 FROM conversation_members peer
+             JOIN participants peer_participant
+               ON peer_participant.id = peer.participant_id
+              AND peer_participant.company_id = peer.company_id
+             WHERE peer.conversation_id = c.id
+               AND peer.company_id = c.company_id
+               AND peer.participant_id <> $1
+               AND peer_participant.departed_at IS NOT NULL
+          )
         )
       ORDER BY c.pinned DESC, c.updated_at DESC
       LIMIT ${CONVERSATION_LIST_LIMIT}`,

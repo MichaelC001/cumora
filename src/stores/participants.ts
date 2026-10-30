@@ -197,6 +197,13 @@ export function bootParticipants() {
           },
         },
       }))
+    } else if (e.type === 'participants.roster_changed') {
+      // Off-board and rehire only flip departedAt on the existing row, so
+      // refetch for every list that filters on it (Agents view, assignee and
+      // mention pickers). The conversation list is reconciled separately in
+      // stores/conversations.
+      if (!isForActiveWorkspace(e.companyId, useAuth.getState().activeCompanyId)) return
+      void useParticipants.getState().refresh()
     }
   })
   // Quiet background refresh — picks up regenerated avatars and any

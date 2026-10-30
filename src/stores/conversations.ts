@@ -173,6 +173,22 @@ function fromApi(c: ApiConversation): Conversation {
   }
 }
 
+/**
+ * Drop a selection whose row just left the sidebar.
+ *
+ * A conversation can disappear without the viewer acting: the other side of a
+ * direct chat was off-boarded, or the viewer was removed by someone else.
+ * Without this, the chat pane keeps rendering a thread for a room the user can
+ * no longer see, and ChatPane's own `if (!c) return null` only blanks pieces
+ * of it. Matches the 404 path in stores/messages.
+ */
+function dropSelectionIfGone(conversations: Conversation[]): void {
+  const active = useApp.getState().selectedConversationId
+  if (!active) return
+  if (conversations.some((c) => c.id === active)) return
+  useApp.getState().selectConversation(null)
+}
+
 function refreshActiveMessagesIfSidebarMoved(conversations: Conversation[]): void {
   const active = useApp.getState().selectedConversationId
   if (!active) return
@@ -214,6 +230,7 @@ export const useConversations = create<ConversationsState>((set, get) => ({
       await commitIfContextCurrent(() => api.getConversations(), (list) => {
         const conversations = list.map(fromApi)
         set({ list: conversations, loaded: true })
+        dropSelectionIfGone(conversations)
         refreshActiveMessagesIfSidebarMoved(conversations)
       })
     } catch (err) {
@@ -225,6 +242,7 @@ export const useConversations = create<ConversationsState>((set, get) => ({
       await commitIfContextCurrent(() => api.getConversations(), (list) => {
         const conversations = list.map(fromApi)
         set({ list: conversations })
+        dropSelectionIfGone(conversations)
         refreshActiveMessagesIfSidebarMoved(conversations)
       })
     } catch (err) {
@@ -329,6 +347,12 @@ export function bootConversations() {
           return next
         }),
       }))
+      return
+    }
+    if (e.type === 'participants.roster_changed') {
+      // Off-board and rehire change rosters and direct-chat visibility, not
+      // any single row, so refetch.
+      void useConversations.getState().reload()
     }
   })
 }

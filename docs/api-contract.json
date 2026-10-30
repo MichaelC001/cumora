@@ -22,6 +22,7 @@
       "participants.avatar",
       "computers.status",
       "participants.added",
+      "participants.roster_changed",
       "message.reactions",
       "group.pulled",
       "conversation.updated",

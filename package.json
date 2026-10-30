@@ -1,7 +1,7 @@
 {
   "name": "cumora",
   "private": true,
-  "version": "0.18.8",
+  "version": "0.18.9",
   "type": "module",
   "main": "electron/main.cjs",
   "bin": {
@@ -93,6 +93,7 @@
     "highlight.js": "^11.11.1",
     "ioredis": "^5.10.1",
     "lib0": "^0.2.117",
+    "mermaid": "^12.2.0",
     "openai": "^6.37.0",
     "pg": "^8.20.0",
     "posthog-js": "^1.373.5",

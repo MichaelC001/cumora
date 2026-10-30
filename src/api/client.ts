@@ -1560,6 +1560,7 @@ export type WsEvent =
       initial: string; avatarBg: string; avatarUrl: string | null;
       status: Status; statusUpdatedAt: string | null;
     } }
+  | { type: 'participants.roster_changed'; companyId: string; kind: 'departed' | 'rehired'; participantId: string }
   | { type: 'message.reactions'; conversationId: string; messageId: string; reactions: Array<{ emoji: string; count: number; mine?: boolean; users?: string[] }> }
   | { type: 'group.pulled'; conversationId: string; pulledById: string }
   | { type: 'conversation.updated'; conversationId: string; patch: { topic?: string | null; title?: string } }

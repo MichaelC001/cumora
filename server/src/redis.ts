@@ -205,6 +205,17 @@ export interface ComputerStatusEvent extends TenantTagged {
   status: 'online' | 'offline' | 'busy'
 }
 
+/** Fired when an agent is off-boarded or rehired. Both change which rosters
+ *  the agent belongs to, which is not a one-row patch on the client: neither
+ *  the group memberships nor the sidebar's direct-chat visibility can be
+ *  derived from the participant row. Clients refetch the roster and the
+ *  conversation list instead. */
+export interface ParticipantRosterChangedEvent extends TenantTagged {
+  type: 'participants.roster_changed'
+  kind: 'departed' | 'rehired'
+  participantId: string
+}
+
 /** Fired when an agent's avatar gets (re-)generated. Clients patch their
  *  local participants store so the new portrait appears without waiting
  *  for the periodic refresh tick. */
@@ -426,7 +437,7 @@ export interface PollUpdatedEvent extends TenantTagged {
 }
 
 export type BroadcastEvent = MessageNewEvent | MessageDeltaEvent | TypingEvent
-  | StatusEvent | AvatarEvent | ParticipantAddedEvent | ReactionsEvent
+  | StatusEvent | AvatarEvent | ParticipantAddedEvent | ParticipantRosterChangedEvent | ReactionsEvent
   | GroupPulledEvent | ConversationUpdatedEvent | ConveneEvent
   | BoardEvent | DocIndexEvent | DocUpdateEvent | DocAwarenessEvent | DocMentionEvent | CalendarReminderEvent
   | CalendarEventChangedEvent

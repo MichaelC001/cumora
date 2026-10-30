@@ -8,6 +8,7 @@ import { remarkCumora } from '@/lib/remarkCumora'
 import type { Message, Participant } from '@/types'
 import { Avatar } from './Avatar'
 import { HumanBadge } from './HumanBadge'
+import { MermaidBlock } from './MermaidBlock'
 import { SkypeEmoji } from './SkypeEmoji'
 import { TwEmoji } from './TwEmoji'
 import { cn, parseBody, parseBlocks } from '@/lib/utils'
@@ -485,7 +486,13 @@ const cumoraMarkdownComponents = {
     const lang = /language-([\w-]+)/.exec(className || '')?.[1] ?? ''
     const raw = codeText(node, children)
     if (lang || raw.includes('\n')) {
-      return <CodeBlock lang={lang} code={raw.replace(/\n$/, '')} />
+      const code = raw.replace(/\n$/, '')
+      // ```mermaid fences become diagrams; unparseable ones fall back to the
+      // plain CodeBlock below so the source is never lost.
+      if (lang === 'mermaid') {
+        return <MermaidBlock code={code} fallback={<CodeBlock lang={lang} code={code} />} />
+      }
+      return <CodeBlock lang={lang} code={code} />
     }
     // A backtick-wrapped artifact id becomes its clickable link (short-id aware).
     const artifact = artifactLinkForCode(raw)
